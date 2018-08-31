@@ -1,13 +1,11 @@
-from __future__ import absolute_import, division, print_function, with_statement
-
 import datetime
 import os
 import shutil
 import tempfile
+import unittest
 
 import tornado.locale
 from tornado.escape import utf8, to_unicode
-from tornado.test.util import unittest, skipOnAppEngine
 from tornado.util import unicode_type
 
 
@@ -37,8 +35,6 @@ class TranslationLoaderTest(unittest.TestCase):
         self.assertTrue(isinstance(locale, tornado.locale.CSVLocale))
         self.assertEqual(locale.translate("school"), u"\u00e9cole")
 
-    # tempfile.mkdtemp is not available on app engine.
-    @skipOnAppEngine
     def test_csv_bom(self):
         with open(os.path.join(os.path.dirname(__file__), 'csv_translations',
                                'fr_FR.csv'), 'rb') as f:
@@ -89,16 +85,17 @@ class EnglishTest(unittest.TestCase):
         self.assertEqual(locale.format_date(date, full_format=True),
                          'April 28, 2013 at 6:35 pm')
 
-        self.assertEqual(locale.format_date(datetime.datetime.utcnow() - datetime.timedelta(seconds=2), full_format=False),
+        now = datetime.datetime.utcnow()
+
+        self.assertEqual(locale.format_date(now - datetime.timedelta(seconds=2), full_format=False),
                          '2 seconds ago')
-        self.assertEqual(locale.format_date(datetime.datetime.utcnow() - datetime.timedelta(minutes=2), full_format=False),
+        self.assertEqual(locale.format_date(now - datetime.timedelta(minutes=2), full_format=False),
                          '2 minutes ago')
-        self.assertEqual(locale.format_date(datetime.datetime.utcnow() - datetime.timedelta(hours=2), full_format=False),
+        self.assertEqual(locale.format_date(now - datetime.timedelta(hours=2), full_format=False),
                          '2 hours ago')
 
-        now = datetime.datetime.utcnow()
-        self.assertEqual(locale.format_date(now - datetime.timedelta(days=1), full_format=False, shorter=True),
-                         'yesterday')
+        self.assertEqual(locale.format_date(now - datetime.timedelta(days=1),
+                                            full_format=False, shorter=True), 'yesterday')
 
         date = now - datetime.timedelta(days=2)
         self.assertEqual(locale.format_date(date, full_format=False, shorter=True),

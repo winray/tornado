@@ -1,18 +1,31 @@
-#!/usr/bin/env python
-
-
-from __future__ import absolute_import, division, print_function, with_statement
-from tornado.httputil import url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp, HTTPServerRequest, parse_request_start_line
+# -*- coding: utf-8 -*-
+from tornado.httputil import (
+    url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
+    HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
+    HTTPInputError, HTTPFile
+)
 from tornado.escape import utf8, native_str
 from tornado.log import gen_log
 from tornado.testing import ExpectLog
-from tornado.test.util import unittest
 
 import copy
 import datetime
 import logging
 import pickle
 import time
+import urllib.parse
+import unittest
+
+from typing import Tuple, Dict, List
+
+
+def form_data_args() -> Tuple[Dict[str, List[bytes]], Dict[str, List[HTTPFile]]]:
+    """Return two empty dicts suitable for use with parse_multipart_form_data.
+
+    mypy insists on type annotations for dict literals, so this lets us avoid
+    the verbose types throughout this test.
+    """
+    return {}, {}
 
 
 class TestUrlConcat(unittest.TestCase):
@@ -42,14 +55,14 @@ class TestUrlConcat(unittest.TestCase):
             "https://localhost/path?x",
             [('y', 'y'), ('z', 'z')],
         )
-        self.assertEqual(url, "https://localhost/path?x&y=y&z=z")
+        self.assertEqual(url, "https://localhost/path?x=&y=y&z=z")
 
     def test_url_concat_trailing_amp(self):
         url = url_concat(
             "https://localhost/path?x&",
             [('y', 'y'), ('z', 'z')],
         )
-        self.assertEqual(url, "https://localhost/path?x&y=y&z=z")
+        self.assertEqual(url, "https://localhost/path?x=&y=y&z=z")
 
     def test_url_concat_mult_params(self):
         url = url_concat(
@@ -65,6 +78,52 @@ class TestUrlConcat(unittest.TestCase):
         )
         self.assertEqual(url, "https://localhost/path?r=1&t=2")
 
+    def test_url_concat_none_params(self):
+        url = url_concat(
+            "https://localhost/path?r=1&t=2",
+            None,
+        )
+        self.assertEqual(url, "https://localhost/path?r=1&t=2")
+
+    def test_url_concat_with_frag(self):
+        url = url_concat(
+            "https://localhost/path#tab",
+            [('y', 'y')],
+        )
+        self.assertEqual(url, "https://localhost/path?y=y#tab")
+
+    def test_url_concat_multi_same_params(self):
+        url = url_concat(
+            "https://localhost/path",
+            [('y', 'y1'), ('y', 'y2')],
+        )
+        self.assertEqual(url, "https://localhost/path?y=y1&y=y2")
+
+    def test_url_concat_multi_same_query_params(self):
+        url = url_concat(
+            "https://localhost/path?r=1&r=2",
+            [('y', 'y')],
+        )
+        self.assertEqual(url, "https://localhost/path?r=1&r=2&y=y")
+
+    def test_url_concat_dict_params(self):
+        url = url_concat(
+            "https://localhost/path",
+            dict(y='y'),
+        )
+        self.assertEqual(url, "https://localhost/path?y=y")
+
+
+class QsParseTest(unittest.TestCase):
+
+    def test_parsing(self):
+        qsstring = "a=1&b=2&a=3"
+        qs = urllib.parse.parse_qs(qsstring)
+        qsl = list(qs_to_qsl(qs))
+        self.assertIn(('a', '1'), qsl)
+        self.assertIn(('a', '3'), qsl)
+        self.assertIn(('b', '2'), qsl)
+
 
 class MultipartFormDataTest(unittest.TestCase):
     def test_file_upload(self):
@@ -74,8 +133,7 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 
 Foo
 --1234--""".replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         parse_multipart_form_data(b"1234", data, args, files)
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
@@ -89,8 +147,7 @@ Content-Disposition: form-data; name=files; filename=ab.txt
 
 Foo
 --1234--""".replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         parse_multipart_form_data(b"1234", data, args, files)
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
@@ -107,19 +164,31 @@ Foo
                      ]
         for filename in filenames:
             logging.debug("trying filename %r", filename)
-            data = """\
+            str_data = """\
 --1234
 Content-Disposition: form-data; name="files"; filename="%s"
 
 Foo
 --1234--""" % filename.replace('\\', '\\\\').replace('"', '\\"')
-            data = utf8(data.replace("\n", "\r\n"))
-            args = {}
-            files = {}
+            data = utf8(str_data.replace("\n", "\r\n"))
+            args, files = form_data_args()
             parse_multipart_form_data(b"1234", data, args, files)
             file = files["files"][0]
             self.assertEqual(file["filename"], filename)
             self.assertEqual(file["body"], b"Foo")
+
+    def test_non_ascii_filename(self):
+        data = b"""\
+--1234
+Content-Disposition: form-data; name="files"; filename="ab.txt"; filename*=UTF-8''%C3%A1b.txt
+
+Foo
+--1234--""".replace(b"\n", b"\r\n")
+        args, files = form_data_args()
+        parse_multipart_form_data(b"1234", data, args, files)
+        file = files["files"][0]
+        self.assertEqual(file["filename"], u"áb.txt")
+        self.assertEqual(file["body"], b"Foo")
 
     def test_boundary_starts_and_ends_with_quotes(self):
         data = b'''\
@@ -128,8 +197,7 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 
 Foo
 --1234--'''.replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         parse_multipart_form_data(b'"1234"', data, args, files)
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
@@ -141,8 +209,7 @@ Foo
 
 Foo
 --1234--'''.replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         with ExpectLog(gen_log, "multipart/form-data missing headers"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
@@ -154,8 +221,7 @@ Content-Disposition: invalid; name="files"; filename="ab.txt"
 
 Foo
 --1234--'''.replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         with ExpectLog(gen_log, "Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
@@ -166,8 +232,7 @@ Foo
 Content-Disposition: form-data; name="files"; filename="ab.txt"
 
 Foo--1234--'''.replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         with ExpectLog(gen_log, "Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
@@ -179,8 +244,7 @@ Content-Disposition: form-data; filename="ab.txt"
 
 Foo
 --1234--""".replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         with ExpectLog(gen_log, "multipart/form-data value missing name"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
@@ -196,8 +260,7 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 Foo
 --1234--
 """.replace(b"\n", b"\r\n")
-        args = {}
-        files = {}
+        args, files = form_data_args()
         parse_multipart_form_data(b"1234", data, args, files)
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
@@ -228,6 +291,13 @@ Foo: even
                          [("Asdf", "qwer zxcv"),
                           ("Foo", "bar baz"),
                           ("Foo", "even more lines")])
+
+    def test_malformed_continuation(self):
+        # If the first line starts with whitespace, it's a
+        # continuation line with nothing to continue, so reject it
+        # (with a proper error).
+        data = " Foo: bar"
+        self.assertRaises(HTTPInputError, HTTPHeaders.parse, data)
 
     def test_unicode_newlines(self):
         # Ensure that only \r\n is recognized as a header separator, and not
@@ -366,6 +436,10 @@ class HTTPServerRequestTest(unittest.TestCase):
         requets = HTTPServerRequest(uri='/')
         self.assertIsInstance(requets.body, bytes)
 
+    def test_repr_does_not_contain_headers(self):
+        request = HTTPServerRequest(uri='/', headers=HTTPHeaders({'Canary': ['Coal Mine']}))
+        self.assertTrue('Canary' not in repr(request))
+
 
 class ParseRequestStartLineTest(unittest.TestCase):
     METHOD = "GET"
@@ -378,3 +452,59 @@ class ParseRequestStartLineTest(unittest.TestCase):
         self.assertEqual(parsed_start_line.method, self.METHOD)
         self.assertEqual(parsed_start_line.path, self.PATH)
         self.assertEqual(parsed_start_line.version, self.VERSION)
+
+
+class ParseCookieTest(unittest.TestCase):
+    # These tests copied from Django:
+    # https://github.com/django/django/pull/6277/commits/da810901ada1cae9fc1f018f879f11a7fb467b28
+    def test_python_cookies(self):
+        """
+        Test cases copied from Python's Lib/test/test_http_cookies.py
+        """
+        self.assertEqual(parse_cookie('chips=ahoy; vienna=finger'),
+                         {'chips': 'ahoy', 'vienna': 'finger'})
+        # Here parse_cookie() differs from Python's cookie parsing in that it
+        # treats all semicolons as delimiters, even within quotes.
+        self.assertEqual(
+            parse_cookie('keebler="E=mc2; L=\\"Loves\\"; fudge=\\012;"'),
+            {'keebler': '"E=mc2', 'L': '\\"Loves\\"', 'fudge': '\\012', '': '"'}
+        )
+        # Illegal cookies that have an '=' char in an unquoted value.
+        self.assertEqual(parse_cookie('keebler=E=mc2'), {'keebler': 'E=mc2'})
+        # Cookies with ':' character in their name.
+        self.assertEqual(parse_cookie('key:term=value:term'), {'key:term': 'value:term'})
+        # Cookies with '[' and ']'.
+        self.assertEqual(parse_cookie('a=b; c=[; d=r; f=h'),
+                         {'a': 'b', 'c': '[', 'd': 'r', 'f': 'h'})
+
+    def test_cookie_edgecases(self):
+        # Cookies that RFC6265 allows.
+        self.assertEqual(parse_cookie('a=b; Domain=example.com'),
+                         {'a': 'b', 'Domain': 'example.com'})
+        # parse_cookie() has historically kept only the last cookie with the
+        # same name.
+        self.assertEqual(parse_cookie('a=b; h=i; a=c'), {'a': 'c', 'h': 'i'})
+
+    def test_invalid_cookies(self):
+        """
+        Cookie strings that go against RFC6265 but browsers will send if set
+        via document.cookie.
+        """
+        # Chunks without an equals sign appear as unnamed values per
+        # https://bugzilla.mozilla.org/show_bug.cgi?id=169091
+        self.assertIn('django_language',
+                      parse_cookie('abc=def; unnamed; django_language=en').keys())
+        # Even a double quote may be an unamed value.
+        self.assertEqual(parse_cookie('a=b; "; c=d'), {'a': 'b', '': '"', 'c': 'd'})
+        # Spaces in names and values, and an equals sign in values.
+        self.assertEqual(parse_cookie('a b c=d e = f; gh=i'), {'a b c': 'd e = f', 'gh': 'i'})
+        # More characters the spec forbids.
+        self.assertEqual(parse_cookie('a   b,c<>@:/[]?{}=d  "  =e,f g'),
+                         {'a   b,c<>@:/[]?{}': 'd  "  =e,f g'})
+        # Unicode characters. The spec only allows ASCII.
+        self.assertEqual(parse_cookie('saint=André Bessette'),
+                         {'saint': native_str('André Bessette')})
+        # Browsers don't send extra whitespace or semicolons in Cookie headers,
+        # but parse_cookie() should parse whitespace the same way
+        # document.cookie parses whitespace.
+        self.assertEqual(parse_cookie('  =  b  ;  ;  =  ;   c  =  ;  '), {'': 'b', 'c': ''})

@@ -1,14 +1,10 @@
 # coding: utf-8
-from __future__ import absolute_import, division, print_function, with_statement
-
 from hashlib import md5
+import unittest
 
 from tornado.escape import utf8
-from tornado.httpclient import HTTPRequest
-from tornado.stack_context import ExceptionStackContext
 from tornado.testing import AsyncHTTPTestCase
 from tornado.test import httpclient_test
-from tornado.test.util import unittest
 from tornado.web import Application, RequestHandler
 
 
@@ -24,21 +20,22 @@ if pycurl is not None:
 @unittest.skipIf(pycurl is None, "pycurl module not present")
 class CurlHTTPClientCommonTestCase(httpclient_test.HTTPClientCommonTestCase):
     def get_http_client(self):
-        client = CurlAsyncHTTPClient(io_loop=self.io_loop,
-                                     defaults=dict(allow_ipv6=False))
+        client = CurlAsyncHTTPClient(defaults=dict(allow_ipv6=False))
         # make sure AsyncHTTPClient magic doesn't give us the wrong class
         self.assertTrue(isinstance(client, CurlAsyncHTTPClient))
         return client
 
 
 class DigestAuthHandler(RequestHandler):
+    def initialize(self, username, password):
+        self.username = username
+        self.password = password
+
     def get(self):
         realm = 'test'
         opaque = 'asdf'
         # Real implementations would use a random nonce.
         nonce = "1234"
-        username = 'foo'
-        password = 'bar'
 
         auth_header = self.request.headers.get('Authorization', None)
         if auth_header is not None:
@@ -53,9 +50,9 @@ class DigestAuthHandler(RequestHandler):
             assert param_dict['realm'] == realm
             assert param_dict['opaque'] == opaque
             assert param_dict['nonce'] == nonce
-            assert param_dict['username'] == username
+            assert param_dict['username'] == self.username
             assert param_dict['uri'] == self.request.path
-            h1 = md5(utf8('%s:%s:%s' % (username, realm, password))).hexdigest()
+            h1 = md5(utf8('%s:%s:%s' % (self.username, realm, self.password))).hexdigest()
             h2 = md5(utf8('%s:%s' % (self.request.method,
                                      self.request.path))).hexdigest()
             digest = md5(utf8('%s:%s:%s' % (h1, nonce, h2))).hexdigest()
@@ -88,31 +85,16 @@ class CurlHTTPClientTestCase(AsyncHTTPTestCase):
 
     def get_app(self):
         return Application([
-            ('/digest', DigestAuthHandler),
+            ('/digest', DigestAuthHandler, {'username': 'foo', 'password': 'bar'}),
+            ('/digest_non_ascii', DigestAuthHandler, {'username': 'foo', 'password': 'barユ£'}),
             ('/custom_reason', CustomReasonHandler),
             ('/custom_fail_reason', CustomFailReasonHandler),
         ])
 
     def create_client(self, **kwargs):
-        return CurlAsyncHTTPClient(self.io_loop, force_instance=True,
+        return CurlAsyncHTTPClient(force_instance=True,
                                    defaults=dict(allow_ipv6=False),
                                    **kwargs)
-
-    def test_prepare_curl_callback_stack_context(self):
-        exc_info = []
-
-        def error_handler(typ, value, tb):
-            exc_info.append((typ, value, tb))
-            self.stop()
-            return True
-
-        with ExceptionStackContext(error_handler):
-            request = HTTPRequest(self.get_url('/'),
-                                  prepare_curl_callback=lambda curl: 1 / 0)
-        self.http_client.fetch(request, callback=self.stop)
-        self.wait()
-        self.assertEqual(1, len(exc_info))
-        self.assertIs(exc_info[0][0], ZeroDivisionError)
 
     def test_digest_auth(self):
         response = self.fetch('/digest', auth_mode='digest',
@@ -127,8 +109,7 @@ class CurlHTTPClientTestCase(AsyncHTTPTestCase):
         response = self.fetch('/custom_fail_reason')
         self.assertEqual(str(response.error), "HTTP 400: Custom reason")
 
-    def test_failed_setup(self):
-        self.http_client = self.create_client(max_clients=1)
-        for i in range(5):
-            response = self.fetch(u'/ユニコード')
-            self.assertIsNot(response.error, None)
+    def test_digest_auth_non_ascii(self):
+        response = self.fetch('/digest_non_ascii', auth_mode='digest',
+                              auth_username='foo', auth_password='barユ£')
+        self.assertEqual(response.body, b'ok')

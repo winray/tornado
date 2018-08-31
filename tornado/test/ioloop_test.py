@@ -1,66 +1,45 @@
-#!/usr/bin/env python
-
-
-from __future__ import absolute_import, division, print_function, with_statement
+from concurrent.futures import ThreadPoolExecutor
+from concurrent import futures
 import contextlib
 import datetime
 import functools
 import socket
+import subprocess
 import sys
 import threading
 import time
+import types
+from unittest import mock
+import unittest
 
+from tornado.escape import native_str
 from tornado import gen
-from tornado.ioloop import IOLoop, TimeoutError, PollIOLoop, PeriodicCallback
+from tornado.ioloop import IOLoop, TimeoutError, PeriodicCallback
 from tornado.log import app_log
-from tornado.platform.select import _Select
-from tornado.stack_context import ExceptionStackContext, StackContext, wrap, NullContext
-from tornado.testing import AsyncTestCase, bind_unused_port, ExpectLog
-from tornado.test.util import unittest, skipIfNonUnix, skipOnTravis, skipBefore35, exec_test
-
-try:
-    from concurrent import futures
-except ImportError:
-    futures = None
-
-
-class FakeTimeSelect(_Select):
-    def __init__(self):
-        self._time = 1000
-        super(FakeTimeSelect, self).__init__()
-
-    def time(self):
-        return self._time
-
-    def sleep(self, t):
-        self._time += t
-
-    def poll(self, timeout):
-        events = super(FakeTimeSelect, self).poll(0)
-        if events:
-            return events
-        self._time += timeout
-        return []
-
-
-class FakeTimeIOLoop(PollIOLoop):
-    """IOLoop implementation with a fake and deterministic clock.
-
-    The clock advances as needed to trigger timeouts immediately.
-    For use when testing code that involves the passage of time
-    and no external dependencies.
-    """
-    def initialize(self):
-        self.fts = FakeTimeSelect()
-        super(FakeTimeIOLoop, self).initialize(impl=self.fts,
-                                               time_func=self.fts.time)
-
-    def sleep(self, t):
-        """Simulate a blocking sleep by advancing the clock."""
-        self.fts.sleep(t)
+from tornado.testing import AsyncTestCase, bind_unused_port, ExpectLog, gen_test
+from tornado.test.util import skipIfNonUnix, skipOnTravis
 
 
 class TestIOLoop(AsyncTestCase):
+    def test_add_callback_return_sequence(self):
+        # A callback returning {} or [] shouldn't spin the CPU, see Issue #1803.
+        self.calls = 0
+
+        loop = self.io_loop
+        test = self
+        old_add_callback = loop.add_callback
+
+        def add_callback(self, callback, *args, **kwargs):
+            test.calls += 1
+            old_add_callback(callback, *args, **kwargs)
+
+        loop.add_callback = types.MethodType(add_callback, loop)
+        loop.add_callback(lambda: {})
+        loop.add_callback(lambda: [])
+        loop.add_timeout(datetime.timedelta(milliseconds=50), loop.stop)
+        loop.start()
+        self.assertLess(self.calls, 10)
+
     @skipOnTravis
     def test_add_callback_wakeup(self):
         # Make sure that add_callback from inside a running IOLoop
@@ -138,10 +117,9 @@ class TestIOLoop(AsyncTestCase):
         other_ioloop.close()
 
     def test_add_callback_while_closing(self):
-        # Issue #635: add_callback() should raise a clean exception
-        # if called while another thread is closing the IOLoop.
-        if IOLoop.configured_class().__name__.endswith('AsyncIOLoop'):
-            raise unittest.SkipTest("AsyncIOMainLoop shutdown not thread safe")
+        # add_callback should not fail if it races with another thread
+        # closing the IOLoop. The callbacks are dropped silently
+        # without executing.
         closing = threading.Event()
 
         def target():
@@ -154,24 +132,7 @@ class TestIOLoop(AsyncTestCase):
         thread.start()
         closing.wait()
         for i in range(1000):
-            try:
-                other_ioloop.add_callback(lambda: None)
-            except RuntimeError as e:
-                self.assertEqual("IOLoop is closing", str(e))
-                break
-
-    def test_handle_callback_exception(self):
-        # IOLoop.handle_callback_exception can be overridden to catch
-        # exceptions in callbacks.
-        def handle_callback_exception(callback):
-            self.assertIs(sys.exc_info()[0], ZeroDivisionError)
-            self.stop()
-        self.io_loop.handle_callback_exception = handle_callback_exception
-        with NullContext():
-            # remove the test StackContext that would see this uncaught
-            # exception as a test failure.
-            self.io_loop.add_callback(lambda: 1 / 0)
-        self.wait()
+            other_ioloop.add_callback(lambda: None)
 
     @skipIfNonUnix  # just because socketpair is so convenient
     def test_read_while_writeable(self):
@@ -243,7 +204,9 @@ class TestIOLoop(AsyncTestCase):
         self.io_loop.call_later(0, results.append, 4)
         self.io_loop.call_later(0, self.stop)
         self.wait()
-        self.assertEqual(results, [1, 2, 3, 4])
+        # The asyncio event loop does not guarantee the order of these
+        # callbacks.
+        self.assertEqual(sorted(results), [1, 2, 3, 4])
 
     def test_add_timeout_return(self):
         # All the timeout methods return non-None handles that can be
@@ -346,43 +309,38 @@ class TestIOLoop(AsyncTestCase):
 
     def test_exception_logging(self):
         """Uncaught exceptions get logged by the IOLoop."""
-        # Use a NullContext to keep the exception from being caught by
-        # AsyncTestCase.
-        with NullContext():
-            self.io_loop.add_callback(lambda: 1 / 0)
-            self.io_loop.add_callback(self.stop)
-            with ExpectLog(app_log, "Exception in callback"):
-                self.wait()
+        self.io_loop.add_callback(lambda: 1 / 0)
+        self.io_loop.add_callback(self.stop)
+        with ExpectLog(app_log, "Exception in callback"):
+            self.wait()
 
     def test_exception_logging_future(self):
         """The IOLoop examines exceptions from Futures and logs them."""
-        with NullContext():
-            @gen.coroutine
-            def callback():
-                self.io_loop.add_callback(self.stop)
-                1 / 0
-            self.io_loop.add_callback(callback)
-            with ExpectLog(app_log, "Exception in callback"):
-                self.wait()
-
-    @skipBefore35
-    def test_exception_logging_native_coro(self):
-        """The IOLoop examines exceptions from awaitables and logs them."""
-        namespace = exec_test(globals(), locals(), """
-        async def callback():
+        @gen.coroutine
+        def callback():
             self.io_loop.add_callback(self.stop)
             1 / 0
-        """)
-        with NullContext():
-            self.io_loop.add_callback(namespace["callback"])
-            with ExpectLog(app_log, "Exception in callback"):
-                self.wait()
+        self.io_loop.add_callback(callback)
+        with ExpectLog(app_log, "Exception in callback"):
+            self.wait()
+
+    def test_exception_logging_native_coro(self):
+        """The IOLoop examines exceptions from awaitables and logs them."""
+        async def callback():
+            # Stop the IOLoop two iterations after raising an exception
+            # to give the exception time to be logged.
+            self.io_loop.add_callback(self.io_loop.add_callback, self.stop)
+            1 / 0
+        self.io_loop.add_callback(callback)
+        with ExpectLog(app_log, "Exception in callback"):
+            self.wait()
 
     def test_spawn_callback(self):
-        # An added callback runs in the test's stack_context, so will be
-        # re-arised in wait().
+        # Both add_callback and spawn_callback run directly on the IOLoop,
+        # so their errors are logged without stopping the test.
         self.io_loop.add_callback(lambda: 1 / 0)
-        with self.assertRaises(ZeroDivisionError):
+        self.io_loop.add_callback(self.stop)
+        with ExpectLog(app_log, "Exception in callback"):
             self.wait()
         # A spawned callback is run directly on the IOLoop, so it will be
         # logged without stopping the test.
@@ -418,6 +376,16 @@ class TestIOLoop(AsyncTestCase):
         finally:
             client.close()
             server.close()
+
+    @gen_test
+    def test_init_close_race(self):
+        # Regression test for #2367
+        def f():
+            for i in range(10):
+                loop = IOLoop()
+                loop.close()
+
+        yield gen.multi([self.io_loop.run_in_executor(None, f) for i in range(2)])
 
 
 # Deliberately not a subclass of AsyncTestCase so the IOLoop isn't
@@ -466,63 +434,16 @@ class TestIOLoopCurrent(unittest.TestCase):
         self.assertIs(self.io_loop, IOLoop.current())
 
 
-class TestIOLoopAddCallback(AsyncTestCase):
-    def setUp(self):
-        super(TestIOLoopAddCallback, self).setUp()
-        self.active_contexts = []
-
-    def add_callback(self, callback, *args, **kwargs):
-        self.io_loop.add_callback(callback, *args, **kwargs)
-
-    @contextlib.contextmanager
-    def context(self, name):
-        self.active_contexts.append(name)
-        yield
-        self.assertEqual(self.active_contexts.pop(), name)
-
-    def test_pre_wrap(self):
-        # A pre-wrapped callback is run in the context in which it was
-        # wrapped, not when it was added to the IOLoop.
-        def f1():
-            self.assertIn('c1', self.active_contexts)
-            self.assertNotIn('c2', self.active_contexts)
-            self.stop()
-
-        with StackContext(functools.partial(self.context, 'c1')):
-            wrapped = wrap(f1)
-
-        with StackContext(functools.partial(self.context, 'c2')):
-            self.add_callback(wrapped)
-
-        self.wait()
-
-    def test_pre_wrap_with_args(self):
-        # Same as test_pre_wrap, but the function takes arguments.
-        # Implementation note: The function must not be wrapped in a
-        # functools.partial until after it has been passed through
-        # stack_context.wrap
-        def f1(foo, bar):
-            self.assertIn('c1', self.active_contexts)
-            self.assertNotIn('c2', self.active_contexts)
-            self.stop((foo, bar))
-
-        with StackContext(functools.partial(self.context, 'c1')):
-            wrapped = wrap(f1)
-
-        with StackContext(functools.partial(self.context, 'c2')):
-            self.add_callback(wrapped, 1, bar=2)
-
-        result = self.wait()
-        self.assertEqual(result, (1, 2))
+class TestIOLoopCurrentAsync(AsyncTestCase):
+    @gen_test
+    def test_clear_without_current(self):
+        # If there is no current IOLoop, clear_current is a no-op (but
+        # should not fail). Use a thread so we see the threading.Local
+        # in a pristine state.
+        with ThreadPoolExecutor(1) as e:
+            yield e.submit(IOLoop.clear_current)
 
 
-class TestIOLoopAddCallbackFromSignal(TestIOLoopAddCallback):
-    # Repeat the add_callback tests using add_callback_from_signal
-    def add_callback(self, callback, *args, **kwargs):
-        self.io_loop.add_callback_from_signal(callback, *args, **kwargs)
-
-
-@unittest.skipIf(futures is None, "futures module not present")
 class TestIOLoopFutures(AsyncTestCase):
     def test_add_future_threads(self):
         with futures.ThreadPoolExecutor(1) as pool:
@@ -532,37 +453,72 @@ class TestIOLoopFutures(AsyncTestCase):
             self.assertTrue(future.done())
             self.assertTrue(future.result() is None)
 
-    def test_add_future_stack_context(self):
-        ready = threading.Event()
+    @gen_test
+    def test_run_in_executor_gen(self):
+        event1 = threading.Event()
+        event2 = threading.Event()
 
-        def task():
-            # we must wait for the ioloop callback to be scheduled before
-            # the task completes to ensure that add_future adds the callback
-            # asynchronously (which is the scenario in which capturing
-            # the stack_context matters)
-            ready.wait(1)
-            assert ready.isSet(), "timed out"
-            raise Exception("worker")
+        def sync_func(self_event, other_event):
+            self_event.set()
+            other_event.wait()
+            # Note that return value doesn't actually do anything,
+            # it is just passed through to our final assertion to
+            # make sure it is passed through properly.
+            return self_event
 
-        def callback(future):
-            self.future = future
-            raise Exception("callback")
+        # Run two synchronous functions, which would deadlock if not
+        # run in parallel.
+        res = yield [
+            IOLoop.current().run_in_executor(None, sync_func, event1, event2),
+            IOLoop.current().run_in_executor(None, sync_func, event2, event1)
+        ]
 
-        def handle_exception(typ, value, traceback):
-            self.exception = value
-            self.stop()
-            return True
+        self.assertEqual([event1, event2], res)
 
-        # stack_context propagates to the ioloop callback, but the worker
-        # task just has its exceptions caught and saved in the Future.
-        with futures.ThreadPoolExecutor(1) as pool:
-            with ExceptionStackContext(handle_exception):
-                self.io_loop.add_future(pool.submit(task), callback)
-            ready.set()
-        self.wait()
+    @gen_test
+    def test_run_in_executor_native(self):
+        event1 = threading.Event()
+        event2 = threading.Event()
 
-        self.assertEqual(self.exception.args[0], "callback")
-        self.assertEqual(self.future.exception().args[0], "worker")
+        def sync_func(self_event, other_event):
+            self_event.set()
+            other_event.wait()
+            return self_event
+
+        # Go through an async wrapper to ensure that the result of
+        # run_in_executor works with await and not just gen.coroutine
+        # (simply passing the underlying concurrrent future would do that).
+        async def async_wrapper(self_event, other_event):
+            return await IOLoop.current().run_in_executor(
+                None, sync_func, self_event, other_event)
+
+        res = yield [
+            async_wrapper(event1, event2),
+            async_wrapper(event2, event1)
+        ]
+
+        self.assertEqual([event1, event2], res)
+
+    @gen_test
+    def test_set_default_executor(self):
+        count = [0]
+
+        class MyExecutor(futures.ThreadPoolExecutor):
+            def submit(self, func, *args):
+                count[0] += 1
+                return super(MyExecutor, self).submit(func, *args)
+
+        event = threading.Event()
+
+        def sync_func():
+            event.set()
+
+        executor = MyExecutor(1)
+        loop = IOLoop.current()
+        loop.set_default_executor(executor)
+        yield loop.run_in_executor(None, sync_func)
+        self.assertEqual(1, count[0])
+        self.assertTrue(event.is_set())
 
 
 class TestIOLoopRunSync(unittest.TestCase):
@@ -583,14 +539,14 @@ class TestIOLoopRunSync(unittest.TestCase):
     def test_async_result(self):
         @gen.coroutine
         def f():
-            yield gen.Task(self.io_loop.add_callback)
+            yield gen.moment
             raise gen.Return(42)
         self.assertEqual(self.io_loop.run_sync(f), 42)
 
     def test_async_exception(self):
         @gen.coroutine
         def f():
-            yield gen.Task(self.io_loop.add_callback)
+            yield gen.moment
             1 / 0
         with self.assertRaises(ZeroDivisionError):
             self.io_loop.run_sync(f)
@@ -603,39 +559,46 @@ class TestIOLoopRunSync(unittest.TestCase):
     def test_timeout(self):
         @gen.coroutine
         def f():
-            yield gen.Task(self.io_loop.add_timeout, self.io_loop.time() + 1)
+            yield gen.sleep(1)
         self.assertRaises(TimeoutError, self.io_loop.run_sync, f, timeout=0.01)
 
-    @skipBefore35
     def test_native_coroutine(self):
-        namespace = exec_test(globals(), locals(), """
-        async def f():
-            await gen.Task(self.io_loop.add_callback)
-        """)
-        self.io_loop.run_sync(namespace['f'])
+        @gen.coroutine
+        def f1():
+            yield gen.moment
+
+        async def f2():
+            await f1()
+        self.io_loop.run_sync(f2)
 
 
-class TestPeriodicCallback(unittest.TestCase):
-    def setUp(self):
-        self.io_loop = FakeTimeIOLoop()
-        self.io_loop.make_current()
+class TestPeriodicCallbackMath(unittest.TestCase):
+    def simulate_calls(self, pc, durations):
+        """Simulate a series of calls to the PeriodicCallback.
 
-    def tearDown(self):
-        self.io_loop.close()
+        Pass a list of call durations in seconds (negative values
+        work to simulate clock adjustments during the call, or more or
+        less equivalently, between calls). This method returns the
+        times at which each call would be made.
+        """
+        calls = []
+        now = 1000
+        pc._next_timeout = now
+        for d in durations:
+            pc._update_next(now)
+            calls.append(pc._next_timeout)
+            now = pc._next_timeout + d
+        return calls
 
     def test_basic(self):
-        calls = []
-
-        def cb():
-            calls.append(self.io_loop.time())
-        pc = PeriodicCallback(cb, 10000)
-        pc.start()
-        self.io_loop.call_later(50, self.io_loop.stop)
-        self.io_loop.start()
-        self.assertEqual(calls, [1010, 1020, 1030, 1040, 1050])
+        pc = PeriodicCallback(None, 10000)
+        self.assertEqual(self.simulate_calls(pc, [0] * 5),
+                         [1010, 1020, 1030, 1040, 1050])
 
     def test_overrun(self):
-        sleep_durations = [9, 9, 10, 11, 20, 20, 35, 35, 0, 0]
+        # If a call runs for too long, we skip entire cycles to get
+        # back on schedule.
+        call_durations = [9, 9, 10, 11, 20, 20, 35, 35, 0, 0, 0]
         expected = [
             1010, 1020, 1030,  # first 3 calls on schedule
             1050, 1070,  # next 2 delayed one cycle
@@ -643,18 +606,69 @@ class TestPeriodicCallback(unittest.TestCase):
             1170, 1210,  # next 2 delayed 3 cycles
             1220, 1230,  # then back on schedule.
         ]
-        calls = []
 
-        def cb():
-            calls.append(self.io_loop.time())
-            if not sleep_durations:
-                self.io_loop.stop()
-                return
-            self.io_loop.sleep(sleep_durations.pop(0))
-        pc = PeriodicCallback(cb, 10000)
-        pc.start()
-        self.io_loop.start()
-        self.assertEqual(calls, expected)
+        pc = PeriodicCallback(None, 10000)
+        self.assertEqual(self.simulate_calls(pc, call_durations),
+                         expected)
+
+    def test_clock_backwards(self):
+        pc = PeriodicCallback(None, 10000)
+        # Backwards jumps are ignored, potentially resulting in a
+        # slightly slow schedule (although we assume that when
+        # time.time() and time.monotonic() are different, time.time()
+        # is getting adjusted by NTP and is therefore more accurate)
+        self.assertEqual(self.simulate_calls(pc, [-2, -1, -3, -2, 0]),
+                         [1010, 1020, 1030, 1040, 1050])
+
+        # For big jumps, we should perhaps alter the schedule, but we
+        # don't currently. This trace shows that we run callbacks
+        # every 10s of time.time(), but the first and second calls are
+        # 110s of real time apart because the backwards jump is
+        # ignored.
+        self.assertEqual(self.simulate_calls(pc, [-100, 0, 0]),
+                         [1010, 1020, 1030])
+
+    def test_jitter(self):
+        random_times = [0.5, 1, 0, 0.75]
+        expected = [1010, 1022.5, 1030, 1041.25]
+        call_durations = [0] * len(random_times)
+        pc = PeriodicCallback(None, 10000, jitter=0.5)
+
+        def mock_random():
+            return random_times.pop(0)
+        with mock.patch('random.random', mock_random):
+            self.assertEqual(self.simulate_calls(pc, call_durations),
+                             expected)
+
+
+class TestIOLoopConfiguration(unittest.TestCase):
+    def run_python(self, *statements):
+        statements = [
+            'from tornado.ioloop import IOLoop',
+            'classname = lambda x: x.__class__.__name__',
+        ] + list(statements)
+        args = [sys.executable, '-c', '; '.join(statements)]
+        return native_str(subprocess.check_output(args)).strip()
+
+    def test_default(self):
+        # When asyncio is available, it is used by default.
+        cls = self.run_python('print(classname(IOLoop.current()))')
+        self.assertEqual(cls, 'AsyncIOMainLoop')
+        cls = self.run_python('print(classname(IOLoop()))')
+        self.assertEqual(cls, 'AsyncIOLoop')
+
+    def test_asyncio(self):
+        cls = self.run_python(
+            'IOLoop.configure("tornado.platform.asyncio.AsyncIOLoop")',
+            'print(classname(IOLoop.current()))')
+        self.assertEqual(cls, 'AsyncIOMainLoop')
+
+    def test_asyncio_main(self):
+        cls = self.run_python(
+            'from tornado.platform.asyncio import AsyncIOMainLoop',
+            'AsyncIOMainLoop().install()',
+            'print(classname(IOLoop.current()))')
+        self.assertEqual(cls, 'AsyncIOMainLoop')
 
 
 if __name__ == "__main__":

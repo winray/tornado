@@ -21,9 +21,9 @@
    .. _verbs:
 
    Implement any of the following methods (collectively known as the
-   HTTP verb methods) to handle the corresponding HTTP method.
-   These methods can be made asynchronous with one of the following
-   decorators: `.gen.coroutine`, `.return_future`, or `asynchronous`.
+   HTTP verb methods) to handle the corresponding HTTP method. These
+   methods can be made asynchronous with the ``async def`` keyword or
+   `.gen.coroutine` decorator.
 
    The arguments to these methods come from the `.URLSpec`: Any
    capturing groups in the regular expression become arguments to the
@@ -71,6 +71,8 @@
       before those methods are called, so the values are available
       during `prepare`.
 
+   .. automethod:: RequestHandler.data_received
+
    Output
    ^^^^^^
 
@@ -89,8 +91,10 @@
    .. automethod:: RequestHandler.send_error
    .. automethod:: RequestHandler.write_error
    .. automethod:: RequestHandler.clear
-   .. automethod:: RequestHandler.data_received
-
+   .. automethod:: RequestHandler.render_linked_js
+   .. automethod:: RequestHandler.render_embed_js
+   .. automethod:: RequestHandler.render_linked_css
+   .. automethod:: RequestHandler.render_embed_css
 
    Cookies
    ^^^^^^^
@@ -121,6 +125,7 @@
    .. automethod:: RequestHandler.compute_etag
    .. automethod:: RequestHandler.create_template_loader
    .. autoattribute:: RequestHandler.current_user
+   .. automethod:: RequestHandler.detach
    .. automethod:: RequestHandler.get_browser_locale
    .. automethod:: RequestHandler.get_current_user
    .. automethod:: RequestHandler.get_login_url
@@ -188,6 +193,14 @@
            of `UIModule` or UI methods to be made available to templates.
            May be set to a module, dictionary, or a list of modules
            and/or dicts.  See :ref:`ui-modules` for more details.
+         * ``websocket_ping_interval``: If set to a number, all websockets will
+           be pinged every n seconds. This can help keep the connection alive
+           through certain proxy servers which close idle connections, and it
+           can detect if the websocket has failed without being properly closed.
+         * ``websocket_ping_timeout``: If the ping interval is set, and the
+           server doesn't receive a 'pong' in this many seconds, it will close
+           the websocket. The default is three times the ping interval, with a
+           minimum of 30 seconds. Ignored if the ping interval is not set.
 
          Authentication and security settings:
 
@@ -259,7 +272,6 @@
 
    Decorators
    ----------
-   .. autofunction:: asynchronous
    .. autofunction:: authenticated
    .. autofunction:: addslash
    .. autofunction:: removeslash

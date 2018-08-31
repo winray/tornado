@@ -1,4 +1,3 @@
-from __future__ import absolute_import, division, print_function, with_statement
 from tornado.ioloop import IOLoop
 from tornado.netutil import ThreadedResolver
 

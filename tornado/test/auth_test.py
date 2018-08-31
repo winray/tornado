@@ -3,36 +3,32 @@
 # and ensure that it doesn't blow up (e.g. with unicode/bytes issues in
 # python 3)
 
-
-from __future__ import absolute_import, division, print_function, with_statement
-from tornado.auth import OpenIdMixin, OAuthMixin, OAuth2Mixin, TwitterMixin, AuthError, GoogleOAuth2Mixin, FacebookGraphMixin
-from tornado.concurrent import Future
+from tornado.auth import (
+    OpenIdMixin, OAuthMixin, OAuth2Mixin,
+    GoogleOAuth2Mixin, FacebookGraphMixin, TwitterMixin,
+)
 from tornado.escape import json_decode
 from tornado import gen
+from tornado.httpclient import HTTPClientError
 from tornado.httputil import url_concat
-from tornado.log import gen_log
-from tornado.testing import AsyncHTTPTestCase, ExpectLog
-from tornado.web import RequestHandler, Application, asynchronous, HTTPError
+from tornado.testing import AsyncHTTPTestCase
+from tornado.web import RequestHandler, Application, HTTPError
 
 
 class OpenIdClientLoginHandler(RequestHandler, OpenIdMixin):
     def initialize(self, test):
         self._OPENID_ENDPOINT = test.get_url('/openid/server/authenticate')
 
-    @asynchronous
+    @gen.coroutine
     def get(self):
         if self.get_argument('openid.mode', None):
-            self.get_authenticated_user(
-                self.on_user, http_client=self.settings['http_client'])
+            user = yield self.get_authenticated_user(http_client=self.settings['http_client'])
+            if user is None:
+                raise Exception("user is None")
+            self.finish(user)
             return
         res = self.authenticate_redirect()
-        assert isinstance(res, Future)
-        assert res.done()
-
-    def on_user(self, user):
-        if user is None:
-            raise Exception("user is None")
-        self.finish(user)
+        assert res is None
 
 
 class OpenIdServerAuthenticateHandler(RequestHandler):
@@ -52,26 +48,23 @@ class OAuth1ClientLoginHandler(RequestHandler, OAuthMixin):
     def _oauth_consumer_token(self):
         return dict(key='asdf', secret='qwer')
 
-    @asynchronous
+    @gen.coroutine
     def get(self):
         if self.get_argument('oauth_token', None):
-            self.get_authenticated_user(
-                self.on_user, http_client=self.settings['http_client'])
+            user = yield self.get_authenticated_user(http_client=self.settings['http_client'])
+            if user is None:
+                raise Exception("user is None")
+            self.finish(user)
             return
-        res = self.authorize_redirect(http_client=self.settings['http_client'])
-        assert isinstance(res, Future)
+        yield self.authorize_redirect(http_client=self.settings['http_client'])
 
-    def on_user(self, user):
-        if user is None:
-            raise Exception("user is None")
-        self.finish(user)
-
-    def _oauth_get_user(self, access_token, callback):
+    @gen.coroutine
+    def _oauth_get_user_future(self, access_token):
         if self.get_argument('fail_in_get_user', None):
             raise Exception("failing in get_user")
         if access_token != dict(key='uiop', secret='5678'):
             raise Exception("incorrect access token %r" % access_token)
-        callback(dict(email='foo@example.com'))
+        return dict(email='foo@example.com')
 
 
 class OAuth1ClientLoginCoroutineHandler(OAuth1ClientLoginHandler):
@@ -121,8 +114,7 @@ class OAuth2ClientLoginHandler(RequestHandler, OAuth2Mixin):
 
     def get(self):
         res = self.authorize_redirect()
-        assert isinstance(res, Future)
-        assert res.done()
+        assert res is None
 
 
 class FacebookClientLoginHandler(RequestHandler, FacebookGraphMixin):
@@ -149,7 +141,7 @@ class FacebookClientLoginHandler(RequestHandler, FacebookGraphMixin):
 
 class FacebookServerAccessTokenHandler(RequestHandler):
     def get(self):
-        self.write('access_token=asdf')
+        self.write(dict(access_token="asdf", expires_in=3600))
 
 
 class FacebookServerMeHandler(RequestHandler):
@@ -169,30 +161,15 @@ class TwitterClientHandler(RequestHandler, TwitterMixin):
 
 
 class TwitterClientLoginHandler(TwitterClientHandler):
-    @asynchronous
-    def get(self):
-        if self.get_argument("oauth_token", None):
-            self.get_authenticated_user(self.on_user)
-            return
-        self.authorize_redirect()
-
-    def on_user(self, user):
-        if user is None:
-            raise Exception("user is None")
-        self.finish(user)
-
-
-class TwitterClientLoginGenEngineHandler(TwitterClientHandler):
-    @asynchronous
-    @gen.engine
+    @gen.coroutine
     def get(self):
         if self.get_argument("oauth_token", None):
             user = yield self.get_authenticated_user()
+            if user is None:
+                raise Exception("user is None")
             self.finish(user)
-        else:
-            # Old style: with @gen.engine we can ignore the Future from
-            # authorize_redirect.
-            self.authorize_redirect()
+            return
+        yield self.authorize_redirect()
 
 
 class TwitterClientLoginGenCoroutineHandler(TwitterClientHandler):
@@ -208,35 +185,21 @@ class TwitterClientLoginGenCoroutineHandler(TwitterClientHandler):
 
 
 class TwitterClientShowUserHandler(TwitterClientHandler):
-    @asynchronous
-    @gen.engine
+    @gen.coroutine
     def get(self):
         # TODO: would be nice to go through the login flow instead of
         # cheating with a hard-coded access token.
-        response = yield gen.Task(self.twitter_request,
-                                  '/users/show/%s' % self.get_argument('name'),
-                                  access_token=dict(key='hjkl', secret='vbnm'))
-        if response is None:
-            self.set_status(500)
-            self.finish('error from twitter request')
-        else:
-            self.finish(response)
-
-
-class TwitterClientShowUserFutureHandler(TwitterClientHandler):
-    @asynchronous
-    @gen.engine
-    def get(self):
         try:
             response = yield self.twitter_request(
                 '/users/show/%s' % self.get_argument('name'),
                 access_token=dict(key='hjkl', secret='vbnm'))
-        except AuthError as e:
+        except HTTPClientError:
+            # TODO(bdarnell): Should we catch HTTP errors and
+            # transform some of them (like 403s) into AuthError?
             self.set_status(500)
-            self.finish(str(e))
-            return
-        assert response is not None
-        self.finish(response)
+            self.finish('error from twitter request')
+        else:
+            self.finish(response)
 
 
 class TwitterServerAccessTokenHandler(RequestHandler):
@@ -294,10 +257,10 @@ class AuthTest(AsyncHTTPTestCase):
                 ('/facebook/client/login', FacebookClientLoginHandler, dict(test=self)),
 
                 ('/twitter/client/login', TwitterClientLoginHandler, dict(test=self)),
-                ('/twitter/client/login_gen_engine', TwitterClientLoginGenEngineHandler, dict(test=self)),
-                ('/twitter/client/login_gen_coroutine', TwitterClientLoginGenCoroutineHandler, dict(test=self)),
-                ('/twitter/client/show_user', TwitterClientShowUserHandler, dict(test=self)),
-                ('/twitter/client/show_user_future', TwitterClientShowUserFutureHandler, dict(test=self)),
+                ('/twitter/client/login_gen_coroutine',
+                 TwitterClientLoginGenCoroutineHandler, dict(test=self)),
+                ('/twitter/client/show_user',
+                 TwitterClientShowUserHandler, dict(test=self)),
 
                 # simulated servers
                 ('/openid/server/authenticate', OpenIdServerAuthenticateHandler),
@@ -308,7 +271,8 @@ class AuthTest(AsyncHTTPTestCase):
                 ('/facebook/server/me', FacebookServerMeHandler),
                 ('/twitter/server/access_token', TwitterServerAccessTokenHandler),
                 (r'/twitter/api/users/show/(.*)\.json', TwitterServerShowUserHandler),
-                (r'/twitter/api/account/verify_credentials\.json', TwitterServerVerifyCredentialsHandler),
+                (r'/twitter/api/account/verify_credentials\.json',
+                 TwitterServerVerifyCredentialsHandler),
             ],
             http_client=self.http_client,
             twitter_consumer_key='test_twitter_consumer_key',
@@ -323,7 +287,10 @@ class AuthTest(AsyncHTTPTestCase):
             '/openid/server/authenticate?' in response.headers['Location'])
 
     def test_openid_get_user(self):
-        response = self.fetch('/openid/client/login?openid.mode=blah&openid.ns.ax=http://openid.net/srv/ax/1.0&openid.ax.type.email=http://axschema.org/contact/email&openid.ax.value.email=foo@example.com')
+        response = self.fetch('/openid/client/login?openid.mode=blah'
+                              '&openid.ns.ax=http://openid.net/srv/ax/1.0'
+                              '&openid.ax.type.email=http://axschema.org/contact/email'
+                              '&openid.ax.value.email=foo@example.com')
         response.rethrow()
         parsed = json_decode(response.body)
         self.assertEqual(parsed["email"], "foo@example.com")
@@ -401,6 +368,9 @@ class AuthTest(AsyncHTTPTestCase):
         self.assertTrue('/facebook/server/authorize?' in response.headers['Location'])
         response = self.fetch('/facebook/client/login?code=1234', follow_redirects=False)
         self.assertEqual(response.code, 200)
+        user = json_decode(response.body)
+        self.assertEqual(user['access_token'], 'asdf')
+        self.assertEqual(user['session_expires'], '3600')
 
     def base_twitter_redirect(self, url):
         # Same as test_oauth10a_redirect
@@ -415,9 +385,6 @@ class AuthTest(AsyncHTTPTestCase):
 
     def test_twitter_redirect(self):
         self.base_twitter_redirect('/twitter/client/login')
-
-    def test_twitter_redirect_gen_engine(self):
-        self.base_twitter_redirect('/twitter/client/login_gen_engine')
 
     def test_twitter_redirect_gen_coroutine(self):
         self.base_twitter_redirect('/twitter/client/login_gen_coroutine')
@@ -443,21 +410,9 @@ class AuthTest(AsyncHTTPTestCase):
                          {'name': 'Somebody', 'screen_name': 'somebody'})
 
     def test_twitter_show_user_error(self):
-        with ExpectLog(gen_log, 'Error response HTTP 500'):
-            response = self.fetch('/twitter/client/show_user?name=error')
+        response = self.fetch('/twitter/client/show_user?name=error')
         self.assertEqual(response.code, 500)
         self.assertEqual(response.body, b'error from twitter request')
-
-    def test_twitter_show_user_future(self):
-        response = self.fetch('/twitter/client/show_user_future?name=somebody')
-        response.rethrow()
-        self.assertEqual(json_decode(response.body),
-                         {'name': 'Somebody', 'screen_name': 'somebody'})
-
-    def test_twitter_show_user_future_error(self):
-        response = self.fetch('/twitter/client/show_user_future?name=error')
-        self.assertEqual(response.code, 500)
-        self.assertIn(b'Error response HTTP 500', response.body)
 
 
 class GoogleLoginHandler(RequestHandler, GoogleOAuth2Mixin):

@@ -1,5 +1,3 @@
-from __future__ import absolute_import, division, print_function, with_statement
-
 import socket
 
 from tornado.http1connection import HTTP1Connection

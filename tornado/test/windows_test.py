@@ -7,6 +7,7 @@ from tornado.platform.auto import set_close_exec
 
 skipIfNonWindows = unittest.skipIf(os.name != 'nt', 'non-windows platform')
 
+
 @skipIfNonWindows
 class WindowsTest(unittest.TestCase):
     def test_set_close_exec(self):
@@ -19,7 +20,5 @@ class WindowsTest(unittest.TestCase):
         r, w = os.pipe()
         self.addCleanup(functools.partial(os.close, r))
         self.addCleanup(functools.partial(os.close, w))
-        with self.assertRaises(WindowsError) as cm:
+        with self.assertRaises(WindowsError):
             set_close_exec(r)
-        ERROR_INVALID_HANDLE = 6
-        self.assertEqual(cm.exception.winerror, ERROR_INVALID_HANDLE)

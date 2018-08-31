@@ -10,14 +10,12 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-
-from __future__ import absolute_import, division, print_function, with_statement
 from datetime import timedelta
+import unittest
 
 from tornado import gen, locks
 from tornado.gen import TimeoutError
 from tornado.testing import gen_test, AsyncTestCase
-from tornado.test.util import unittest, skipBefore35, exec_test
 
 
 class ConditionTest(AsyncTestCase):
@@ -34,6 +32,16 @@ class ConditionTest(AsyncTestCase):
             else:
                 self.history.append(key)
         future.add_done_callback(callback)
+
+    def loop_briefly(self):
+        """Run all queued callbacks on the IOLoop.
+
+        In these tests, this method is used after calling notify() to
+        preserve the pre-5.0 behavior in which callbacks ran
+        synchronously.
+        """
+        self.io_loop.add_callback(self.stop)
+        self.wait()
 
     def test_repr(self):
         c = locks.Condition()
@@ -53,8 +61,10 @@ class ConditionTest(AsyncTestCase):
         self.record_done(c.wait(), 'wait1')
         self.record_done(c.wait(), 'wait2')
         c.notify(1)
+        self.loop_briefly()
         self.history.append('notify1')
         c.notify(1)
+        self.loop_briefly()
         self.history.append('notify2')
         self.assertEqual(['wait1', 'notify1', 'wait2', 'notify2'],
                          self.history)
@@ -65,12 +75,15 @@ class ConditionTest(AsyncTestCase):
             self.record_done(c.wait(), i)
 
         c.notify(3)
+        self.loop_briefly()
 
         # Callbacks execute in the order they were registered.
         self.assertEqual(list(range(3)), self.history)
         c.notify(1)
+        self.loop_briefly()
         self.assertEqual(list(range(4)), self.history)
         c.notify(2)
+        self.loop_briefly()
         self.assertEqual(list(range(6)), self.history)
 
     def test_notify_all(self):
@@ -79,6 +92,7 @@ class ConditionTest(AsyncTestCase):
             self.record_done(c.wait(), i)
 
         c.notify_all()
+        self.loop_briefly()
         self.history.append('notify_all')
 
         # Callbacks execute in the order they were registered.
@@ -125,6 +139,7 @@ class ConditionTest(AsyncTestCase):
         self.assertEqual(['timeout', 0, 2], self.history)
         self.assertEqual(['timeout', 0, 2], self.history)
         c.notify()
+        yield
         self.assertEqual(['timeout', 0, 2, 3], self.history)
 
     @gen_test
@@ -139,6 +154,7 @@ class ConditionTest(AsyncTestCase):
         self.assertEqual(['timeout'], self.history)
 
         c.notify_all()
+        yield
         self.assertEqual(['timeout', 0, 2], self.history)
 
     @gen_test
@@ -154,6 +170,7 @@ class ConditionTest(AsyncTestCase):
         # resolving third future.
         futures[1].add_done_callback(lambda _: c.notify())
         c.notify(2)
+        yield
         self.assertTrue(all(f.done() for f in futures))
 
     @gen_test
@@ -330,18 +347,15 @@ class SemaphoreContextManagerTest(AsyncTestCase):
         # Semaphore was released and can be acquired again.
         self.assertTrue(sem.acquire().done())
 
-    @skipBefore35
     @gen_test
     def test_context_manager_async_await(self):
         # Repeat the above test using 'async with'.
         sem = locks.Semaphore()
 
-        namespace = exec_test(globals(), locals(), """
         async def f():
             async with sem as yielded:
                 self.assertTrue(yielded is None)
-        """)
-        yield namespace['f']()
+        yield f()
 
         # Semaphore was released and can be acquired again.
         self.assertTrue(sem.acquire().done())
@@ -461,7 +475,6 @@ class LockTests(AsyncTestCase):
         yield futures
         self.assertEqual(list(range(N)), history)
 
-    @skipBefore35
     @gen_test
     def test_acquire_fifo_async_with(self):
         # Repeat the above test using `async with lock:`
@@ -471,12 +484,10 @@ class LockTests(AsyncTestCase):
         N = 5
         history = []
 
-        namespace = exec_test(globals(), locals(), """
         async def f(idx):
             async with lock:
                 history.append(idx)
-        """)
-        futures = [namespace['f'](i) for i in range(N)]
+        futures = [f(i) for i in range(N)]
         lock.release()
         yield futures
         self.assertEqual(list(range(N)), history)

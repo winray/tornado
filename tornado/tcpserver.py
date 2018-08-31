@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 #
 # Copyright 2011 Facebook
 #
@@ -15,12 +14,13 @@
 # under the License.
 
 """A non-blocking, single-threaded TCP server."""
-from __future__ import absolute_import, division, print_function, with_statement
 
 import errno
 import os
 import socket
+import ssl
 
+from tornado import gen
 from tornado.log import app_log
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream, SSLIOStream
@@ -28,18 +28,25 @@ from tornado.netutil import bind_sockets, add_accept_handler, ssl_wrap_socket
 from tornado import process
 from tornado.util import errno_from_exception
 
-try:
-    import ssl
-except ImportError:
-    # ssl is not available on Google App Engine.
-    ssl = None
-
 
 class TCPServer(object):
     r"""A non-blocking, single-threaded TCP server.
 
     To use `TCPServer`, define a subclass which overrides the `handle_stream`
-    method.
+    method. For example, a simple echo server could be defined like this::
+
+      from tornado.tcpserver import TCPServer
+      from tornado.iostream import StreamClosedError
+      from tornado import gen
+
+      class EchoServer(TCPServer):
+          async def handle_stream(self, stream, address):
+              while True:
+                  try:
+                      data = await stream.read_until(b"\n")
+                      await stream.write(data)
+                  except StreamClosedError:
+                      break
 
     To make this server serve SSL traffic, send the ``ssl_options`` keyword
     argument with an `ssl.SSLContext` object. For compatibility with older
@@ -87,14 +94,18 @@ class TCPServer(object):
 
     .. versionadded:: 3.1
        The ``max_buffer_size`` argument.
+
+    .. versionchanged:: 5.0
+       The ``io_loop`` argument has been removed.
     """
-    def __init__(self, io_loop=None, ssl_options=None, max_buffer_size=None,
+    def __init__(self, ssl_options=None, max_buffer_size=None,
                  read_chunk_size=None):
-        self.io_loop = io_loop
         self.ssl_options = ssl_options
-        self._sockets = {}  # fd -> socket object
+        self._sockets = {}   # fd -> socket object
+        self._handlers = {}  # fd -> remove_handler callable
         self._pending_sockets = []
         self._started = False
+        self._stopped = False
         self.max_buffer_size = max_buffer_size
         self.read_chunk_size = read_chunk_size
 
@@ -135,13 +146,10 @@ class TCPServer(object):
         method and `tornado.process.fork_processes` to provide greater
         control over the initialization of a multi-process server.
         """
-        if self.io_loop is None:
-            self.io_loop = IOLoop.current()
-
         for sock in sockets:
             self._sockets[sock.fileno()] = sock
-            add_accept_handler(sock, self._handle_connection,
-                               io_loop=self.io_loop)
+            self._handlers[sock.fileno()] = add_accept_handler(
+                sock, self._handle_connection)
 
     def add_socket(self, socket):
         """Singular version of `add_sockets`.  Takes a single socket object."""
@@ -213,8 +221,13 @@ class TCPServer(object):
         Requests currently in progress may still continue after the
         server is stopped.
         """
+        if self._stopped:
+            return
+        self._stopped = True
         for fd, sock in self._sockets.items():
-            self.io_loop.remove_handler(fd)
+            assert sock.fileno() == fd
+            # Unregister socket from IOLoop
+            self._handlers.pop(fd)()
             sock.close()
 
     def handle_stream(self, stream, address):
@@ -264,15 +277,17 @@ class TCPServer(object):
                     raise
         try:
             if self.ssl_options is not None:
-                stream = SSLIOStream(connection, io_loop=self.io_loop,
+                stream = SSLIOStream(connection,
                                      max_buffer_size=self.max_buffer_size,
                                      read_chunk_size=self.read_chunk_size)
             else:
-                stream = IOStream(connection, io_loop=self.io_loop,
+                stream = IOStream(connection,
                                   max_buffer_size=self.max_buffer_size,
                                   read_chunk_size=self.read_chunk_size)
+
             future = self.handle_stream(stream, address)
             if future is not None:
-                self.io_loop.add_future(future, lambda f: f.result())
+                IOLoop.current().add_future(gen.convert_yielded(future),
+                                            lambda f: f.result())
         except Exception:
             app_log.error("Error in connection callback", exc_info=True)
